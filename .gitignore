@@ -1,0 +1,7 @@
+.env
+token.json
+bulbs.json
+venv/
+__pycache__/
+*.pyc
+.claude/
