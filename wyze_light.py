@@ -28,8 +28,12 @@ ENV_PATH = BASE / ".env"
 TOKEN_PATH = BASE / "token.json"
 BULBS_PATH = BASE / "bulbs.json"
 PID_PATH = BASE / "pulse.pid"
+STATE_PATH = BASE / "state.json"
 # Wyze access tokens live ~48h. Refresh if older than 24h.
 TOKEN_TTL = 24 * 3600
+# Re-apply even cached static modes after this long, in case the bulb
+# state drifted (manual toggle, power cut, etc.).
+STATE_TTL = 30 * 60
 # Breathing sequence of red shades + brightness. Tuples of (hex, brightness).
 PULSE_FRAMES = [
     ("FF0000", 100),
@@ -105,15 +109,42 @@ def kill_pulse():
         pass
 
 
+STATIC_COLORS = {
+    "red": "FF0000",
+    "blue": "0000FF",
+}
+
+
+def _cached_mode():
+    if not STATE_PATH.exists():
+        return None
+    try:
+        st = json.loads(STATE_PATH.read_text())
+        if time.time() - st.get("ts", 0) > STATE_TTL:
+            return None
+        return st.get("mode")
+    except Exception:
+        return None
+
+
+def _write_state(mode):
+    STATE_PATH.write_text(json.dumps({"mode": mode, "ts": time.time()}))
+
+
 def _apply_static(mode):
+    # Debounce repeated applies of the same mode — PreToolUse can fire
+    # many times during a single response and each call is 6 cloud RPCs.
+    if _cached_mode() == mode:
+        return
+
     bulbs = json.loads(BULBS_PATH.read_text())
     client = get_client()
 
     def _one(bulb):
         mac, model = bulb["mac"], bulb["model"]
         client.bulbs.turn_on(device_mac=mac, device_model=model)
-        if mode == "red":
-            client.bulbs.set_color(device_mac=mac, device_model=model, color="FF0000")
+        if mode in STATIC_COLORS:
+            client.bulbs.set_color(device_mac=mac, device_model=model, color=STATIC_COLORS[mode])
         elif mode == "normal":
             client.bulbs.set_color_temp(device_mac=mac, device_model=model, color_temp=4600)
         else:
@@ -122,6 +153,8 @@ def _apply_static(mode):
 
     with ThreadPoolExecutor(max_workers=len(bulbs)) as pool:
         list(pool.map(_one, bulbs))
+
+    _write_state(mode)
 
 
 def _pulse_frame(client, bulbs, color, brightness):
@@ -142,9 +175,17 @@ def _pulse_frame(client, bulbs, color, brightness):
 
 
 def run_pulse():
-    # Ensure no other pulse is running, then claim the PID slot.
-    kill_pulse()
+    # If a pulse is already alive, leave it alone — this keeps PreToolUse
+    # from restarting the loop on every tool call.
+    if PID_PATH.exists():
+        try:
+            existing = int(PID_PATH.read_text().strip())
+            os.kill(existing, 0)
+            return
+        except (ValueError, ProcessLookupError):
+            pass  # stale pid file, fall through and start fresh
     PID_PATH.write_text(str(os.getpid()))
+    _write_state("pulse")
 
     def _shutdown(*_):
         sys.exit(0)
