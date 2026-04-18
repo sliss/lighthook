@@ -219,6 +219,11 @@ def apply(mode):
     if mode == "pulse":
         run_pulse()
         return
+    # Notification fires for permission prompts AND end-of-turn "your turn"
+    # indicators. Only treat it as attention-grabbing if Claude was actively
+    # working; otherwise let Stop's `normal` stand.
+    if mode == "blue" and _cached_mode() not in ("red", "pulse"):
+        return
     # Static modes stop any running pulse first.
     kill_pulse()
     _apply_static(mode)
